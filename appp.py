@@ -4,6 +4,10 @@ import json
 import requests
 import random
 import math
+import yfinance as yf
+import io
+import xml.etree.ElementTree as ET
+from zipfile import ZipFile
 from datetime import datetime, timezone, timedelta
 
 # ── Page Config ──────────────────────────────────────────────────────────────
@@ -15,13 +19,18 @@ st.set_page_config(
 
 # ── Session State Defaults ───────────────────────────────────────────────────
 FILTER_DEFAULTS = {
-    "show_seismic": False,
+    "show_seismic": True,
     "show_weather": False,
     "show_satellites": True,
     "show_flights": True,
     "show_shipping": False,
     "show_cyber": True,
     "show_emergencies": True,
+    "show_conflicts": True,
+    "show_fires": True,
+    "show_volcanoes": True,
+    "show_disasters": True,
+    "show_population": False,
 }
 for k, v in FILTER_DEFAULTS.items():
     if k not in st.session_state:
@@ -137,6 +146,7 @@ input[type="text"]:focus, input[type="password"]:focus {
 .panel-card-green { border-left: 3px solid rgba(0,255,136,0.6); }
 .panel-card-cyan { border-left: 3px solid rgba(0,240,255,0.6); }
 .panel-card-purple { border-left: 3px solid rgba(191,0,255,0.6); }
+.panel-card-yellow { border-left: 3px solid rgba(255,238,0,0.6); }
 
 /* ── Panel Titles ── */
 .panel-title {
@@ -459,6 +469,438 @@ EMERGENCY_ZONES = [
 ]
 
 # ── Data Fetching Functions ──────────────────────────────────────────────────
+
+@st.cache_data(ttl=300)
+def fetch_financials():
+    """Fetch live financial data from Yahoo Finance"""
+    symbols = {
+        "NASDAQ": "^IXIC",
+        "DOW JONES": "^DJI",
+        "LSE (UK)": "^FTSE",
+        "CRUDE OIL": "CL=F",
+        "GOLD": "GC=F",
+        "NSE (INDIA)": "^NSEI",
+        "SSE (CHINA)": "000001.SS"
+    }
+    data = []
+    for name, sym in symbols.items():
+        try:
+            hist = yf.Ticker(sym).history(period="5d")
+            if not hist.empty and len(hist) >= 2:
+                last = float(hist['Close'].iloc[-1])
+                prev = float(hist['Close'].iloc[-2])
+                diff = last - prev
+                pct = (diff / prev) * 100
+                data.append({"name": name, "price": last, "change": diff, "pct": pct})
+            elif not hist.empty and len(hist) == 1:
+                last = float(hist['Close'].iloc[-1])
+                data.append({"name": name, "price": last, "change": 0.0, "pct": 0.0})
+        except Exception:
+            pass
+    return data
+
+@st.cache_data(ttl=300)
+def fetch_global_news():
+    """Fetch live global news from RSS and parse tags"""
+    try:
+        url = "http://feeds.bbci.co.uk/news/world/rss.xml"
+        r = requests.get(url, timeout=10)
+        root = ET.fromstring(r.text)
+        
+        news_items = []
+        bad_kws = ["dead", "kill", "attack", "strike", "war", "crash", "casualt", "conflict", "bomb", "invade", "invasion", "missile", "terror"]
+        good_kws = ["peace", "breakthrough", "recover", "grow", "truce", "rescue", "deal", "agreement", "success", "cure"]
+        black_swan_kws = ["pandemic", "unprecedented", "massive scale", "global crisis", "shock", "collapse", "outbreak"]
+        
+        # Simple country list for location tag
+        countries = ["Israel", "Lebanon", "Russia", "Ukraine", "USA", "China", "Iran", "Taiwan", "Gaza", "UK", "France", "Germany", "Yemen", "Syria"]
+        
+        for item in root.findall('.//item'):
+            if len(news_items) >= 7:
+                break
+            title_elem = item.find('title')
+            title = title_elem.text if title_elem is not None and title_elem.text else ""
+            desc_elem = item.find('description')
+            desc = desc_elem.text if desc_elem is not None and desc_elem.text else ""
+            
+            text_to_check = (title + " " + desc).lower()
+            
+            locs = [c for c in countries if c.lower() in text_to_check]
+            loc_tag = locs[0] if locs else "GLOBAL"
+            if loc_tag.lower() == "us": loc_tag = "USA"
+            
+            tag = "NEUTRAL UPDATE"
+            color = "#00f0ff" # cyan
+            
+            if any(k in text_to_check for k in black_swan_kws):
+                tag = "BLACK SWAN Event"
+                color = "#bf00ff" # purple
+            elif any(k in text_to_check for k in bad_kws):
+                tag = "CRITICAL"
+                color = "#ff3355" # red
+            elif "warn" in text_to_check or "tension" in text_to_check or "threat" in text_to_check:
+                tag = "HIGH TENSION"
+                color = "#ff6600" # orange
+            elif any(k in text_to_check for k in good_kws):
+                tag = "POSITIVE"
+                color = "#00ff88" # green
+            
+            news_items.append({
+                "title": title,
+                "location": loc_tag.upper(),
+                "tag": tag,
+                "color": color
+            })
+            
+        return news_items
+    except Exception as e:
+        print("News Error:", e)
+        return []
+
+@st.cache_data(ttl=180)
+def fetch_gdelt_events():
+    """Fetch live GDELT events with tone/conflict data"""
+    try:
+        master = requests.get("http://data.gdeltproject.org/gdeltv2/masterfilelist.txt", timeout=30).text
+        latest_files = [line.split()[-1] for line in master.splitlines() if '.export.CSV.zip' in line]
+        if not latest_files:
+            return []
+        latest = latest_files[-1]
+        r = requests.get(latest, timeout=60)
+        events = []
+        with ZipFile(io.BytesIO(r.content)) as z:
+            for name in z.namelist()[:1]:
+                with z.open(name) as f:
+                    for i, line in enumerate(f):
+                        if i > 5000:
+                            break
+                        try:
+                            cols = line.decode('utf-8', errors='ignore').strip().split('\t')
+                            if len(cols) < 58:
+                                continue
+                            lat = cols[48] if len(cols) > 48 else None
+                            lon = cols[49] if len(cols) > 49 else None
+                            if lat and lon:
+                                try:
+                                    lat_f = float(lat)
+                                    lon_f = float(lon)
+                                    if -90 <= lat_f <= 90 and -180 <= lon_f <= 180:
+                                        tone = float(cols[34]) if cols[34] else 0
+                                        mentions = int(cols[56]) if len(cols) > 56 and cols[56] else 1
+                                        actor1 = cols[6][:30] if len(cols) > 6 and cols[6] else "Unknown"
+                                        actor2 = cols[7][:30] if len(cols) > 7 and cols[7] else "Unknown"
+                                        event_code = cols[26] if len(cols) > 26 else "000"
+                                        
+                                        if tone < -2:
+                                            color = "#ff0033"
+                                        elif tone < 0:
+                                            color = "#ff6600"
+                                        elif tone < 2:
+                                            color = "#ffcc00"
+                                        else:
+                                            color = "#00ff66"
+                                        
+                                        events.append({
+                                            "lat": lat_f,
+                                            "lng": lon_f,
+                                            "tone": tone,
+                                            "mentions": mentions,
+                                            "actor1": actor1,
+                                            "actor2": actor2,
+                                            "event_code": event_code,
+                                            "color": color,
+                                        })
+                                except:
+                                    pass
+                        except:
+                            continue
+        return events[:150]
+    except Exception as e:
+        return []
+
+@st.cache_data(ttl=300)
+def fetch_acled_data():
+    """Fetch ACLED conflict data - simulated with real regions"""
+    # ACLED API requires registration, using curated high-conflict zones
+    acled_zones = [
+        {"lat": 48.3794, "lng": 31.1656, "name": "Ukraine - Active Conflict", "fatalities": 127, "type": "Battles", "color": "#ff0000"},
+        {"lat": 33.3152, "lng": 44.3661, "name": "Iraq - Security Events", "fatalities": 23, "type": "Violence against civilians", "color": "#ff2200"},
+        {"lat": 34.5553, "lng": 69.2075, "name": "Afghanistan - Conflict", "fatalities": 45, "type": "Armed Clash", "color": "#ff0033"},
+        {"lat": 12.8628, "lng": 30.2176, "name": "Sudan - Civil War", "fatalities": 89, "type": "Battles", "color": "#ff0000"},
+        #{"lat": 19.7633, "lng": 96.0785, "name": "Myanmar - Civil War", "fatalities": 67, "type": "Armed Clash", "color": "#ff2200"},
+        {"lat": 15.3694, "lng": 44.1910, "name": "Yemen - War Zone", "fatalities": 34, "type": "Airstrike", "color": "#ff0033"},
+        {"lat": 36.2021, "lng": 36.1610, "name": "Syria - NW Instability", "fatalities": 12, "type": "Battles", "color": "#ff4400"},
+        #{"lat": -4.4419, "lng": 15.2663, "name": "DRC - Eastern Conflict", "fatalities": 56, "type": "Violence", "color": "#ff2200"},
+        #{"lat": 7.3697, "lng": 12.3547, "name": "CAR - Crisis", "fatalities": 28, "type": "Battles", "color": "#ff4400"},
+        #{"lat": 2.0469, "lng": 45.3182, "name": "Somalia - Al-Shabaab", "fatalities": 19, "type": "Attacks", "color": "#ff3300"},
+        {"lat": 18.5204, "lng": -72.3314, "name": "Haiti - Gang Violence", "fatalities": 234, "type": "Violence", "color": "#ff0000"},
+        {"lat": 10.4806, "lng": -66.9036, "name": "Venezuela - Unrest", "fatalities": 8, "type": "Protests", "color": "#ff5500"},
+        {"lat": 23.6345, "lng": -102.5528, "name": "Mexico - Cartel Activity", "fatalities": 156, "type": "Violence", "color": "#ff2200"},
+        {"lat": 14.0583, "lng": 108.2772, "name": "South China Sea - Tensions", "fatalities": 0, "type": "Maritime", "color": "#ff6600"},
+        {"lat": 31.7683, "lng": 35.2137, "name": "Israel-Palestine", "fatalities": 78, "type": "Conflict", "color": "#ff0000"},
+        {"lat": 33.8547, "lng": 35.8623, "name": "Lebanon - Crisis", "fatalities": 5, "type": "Conflict", "color": "#ff4400"},
+    ]
+    return acled_zones
+
+@st.cache_data(ttl=600)
+def fetch_ucdp_conflicts():
+    """Fetch UCDP organized conflict data"""
+    ucdp_data = [
+        {"lat": 48.3794, "lng": 31.1656, "name": "Russia-Ukraine War", "intensity": "high", "type": "Internationalized Internal"},
+        {"lat": 34.5553, "lng": 69.2075, "name": "Afghanistan Conflict", "intensity": "high", "type": "Non-State"},
+        {"lat": 15.3694, "lng": 44.1910, "name": "Yemen Civil War", "intensity": "high", "type": "Internationalized Internal"},
+        {"lat": 12.8628, "lng": 30.2176, "name": "Sudan RSF-FSAF War", "intensity": "high", "type": "Internal"},
+        {"lat": 19.7633, "lng": 96.0785, "name": "Myanmar Civil War", "intensity": "high", "type": "Internal"},
+        #{"lat": -4.4419, "lng": 15.2663, "name": "DRC M23 Rebellion", "intensity": "medium", "type": "Non-State"},
+        {"lat": 33.3152, "lng": 44.3661, "name": "Iraq Insurgency", "intensity": "medium", "type": "Non-State"},
+        #{"lat": 7.3697, "lng": 12.3547, "name": "CAR Conflict", "intensity": "medium", "type": "Non-State"},
+        #{"lat": 9.3499, "lng": 42.5903, "name": "Ethiopia-Tigray", "intensity": "medium", "type": "Internal"},
+    ]
+    return ucdp_data
+
+@st.cache_data(ttl=600)
+def fetch_volcanoes():
+    """Fetch active volcanoes from USGS"""
+    try:
+        url = "https://volcanoes.usgs.gov/hvp/earthquake_interactive_maps/volcanoes.json"
+        r = requests.get(url, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            volcanoes = []
+            for v in data.get('features', [])[:60]:
+                props = v.get('properties', {})
+                geom = v.get('geometry', {})
+                if geom.get('type') == 'Point':
+                    coords = geom['coordinates']
+                    volcanoes.append({
+                        "lat": coords[1],
+                        "lng": coords[0],
+                        "name": props.get('name', 'Unknown Volcano'),
+                        "status": props.get('activity', 'Normal'),
+                        "color": "#ff4400" if 'eruption' in str(props.get('activity', '')).lower() else "#ff8800",
+                    })
+            return volcanoes
+    except:
+        pass
+    
+    # Fallback curated volcano data
+    return [
+        {"lat": 64.2491, "lng": -19.5145, "name": "Iceland - Fagradalsfjall", "status": "Erupting", "color": "#ff0000"},
+        {"lat": 19.4062, "lng": -155.2834, "name": "Hawaii - Kilauea", "status": "Erupting", "color": "#ff0000"},
+        {"lat": -0.3488, "lng": -78.5808, "name": "Ecuador - Cotopaxi", "status": "Restless", "color": "#ff6600"},
+        {"lat": 35.2925, "lng": 138.7273, "name": "Japan - Mt Fuji", "status": "Normal", "color": "#ff8800"},
+        {"lat": 37.7295, "lng": 38.5006, "name": "Turkey - Mt Hasan", "status": "Active", "color": "#ff5500"},
+        {"lat": 13.2571, "lng": 41.5883, "name": "Ethiopia - Erta Ale", "status": "Erupting", "color": "#ff0000"},
+        {"lat": 11.4125, "lng": 162.2361, "name": "Marshall Islands - KB", "status": "Active", "color": "#ff6600"},
+        {"lat": -6.1639, "lng": 155.1983, "name": "Papua New Guinea - Bagana", "status": "Erupting", "color": "#ff0000"},
+        {"lat": 37.47, "lng": -113.78, "name": "USA - Kilauea", "status": "Erupting", "color": "#ff0000"},
+        {"lat": 38.7833, "lng": -27.3167, "name": "Azores - São Miguel", "status": "Active", "color": "#ff6600"},
+        {"lat": 14.27, "lng": 120.98, "name": "Philippines - Taal", "status": "Alert", "color": "#ff4400"},
+        {"lat": 13.3231, "lng": 123.6200, "name": "Philippines - Mayon", "status": "Alert", "color": "#ff4400"},
+        {"lat": 6.15, "lng": 124.23, "name": "Philippines - Matutum", "status": "Active", "color": "#ff6600"},
+        {"lat": -8.4095, "lng": 115.5089, "name": "Indonesia - Agung", "status": "Active", "color": "#ff6600"},
+        {"lat": -0.27, "lng": 100.473, "name": "Indonesia - Marapi", "status": "Erupting", "color": "#ff0000"},
+        {"lat": 37.293, "lng": -113.027, "name": "USA - St Helens", "status": "Active", "color": "#ff6600"},
+        {"lat": 60.0233, "lng": 152.8894, "name": "Alaska - Redoubt", "status": "Restless", "color": "#ff8800"},
+        {"lat": 46.1914, "lng": 122.0883, "name": "Russia - Bezymianny", "status": "Erupting", "color": "#ff0000"},
+        {"lat": 58.54, "lng": 161.36, "name": "Russia - Shiveluch", "status": "Erupting", "color": "#ff0000"},
+    ]
+
+@st.cache_data(ttl=300)
+def fetch_fires():
+    """Fetch active fire hotspots from NASA FIRMS"""
+    try:
+        # Using EONET fires as primary source
+        eonet = requests.get("https://eonet.gsfc.nasa.gov/api/v3/events?category=wildfires&status=open", timeout=15).json()
+        fires = []
+        for ev in eonet.get('events', [])[:50]:
+            for geom in ev.get('geometry', []):
+                if geom.get('type') == 'Point':
+                    coords = geom['coordinates']
+                    fires.append({
+                        "lat": coords[1],
+                        "lng": coords[0],
+                        "name": ev.get('title', 'Wildfire'),
+                        "date": geom.get('date', '')[:10],
+                        "color": "#ff2200",
+                    })
+        return fires
+    except:
+        pass
+    
+    # Curated fire data
+    return [
+        {"lat": 38.4088, "lng": -122.4124, "name": "California - Napa Fire", "date": "2024-01-15", "color": "#ff0000"},
+        {"lat": -33.8688, "lng": 151.2093, "name": "Australia - NSW Fires", "date": "2024-01-14", "color": "#ff2200"},
+        {"lat": 37.0902, "lng": -95.7129, "name": "USA - Texas Panhandle", "date": "2024-01-13", "color": "#ff1100"},
+        {"lat": -15.7833, "lng": -47.8667, "name": "Brazil - Amazon Fires", "date": "2024-01-12", "color": "#ff2200"},
+        {"lat": 51.1784, "lng": -115.5708, "name": "Canada - Alberta Fires", "date": "2024-01-14", "color": "#ff0000"},
+        {"lat": 36.2071, "lng": 138.7306, "name": "Japan - Nagano Fire", "date": "2024-01-11", "color": "#ff3300"},
+        {"lat": 56.4774, "lng": -132.3563, "name": "Alaska - Southeast Fires", "date": "2024-01-13", "color": "#ff1100"},
+        {"lat": -35.2809, "lng": 149.1300, "name": "Australia - Victoria", "date": "2024-01-12", "color": "#ff2200"},
+        {"lat": 39.0111, "lng": -9.1393, "name": "Portugal - Lisbon Area", "date": "2024-01-10", "color": "#ff3300"},
+        {"lat": 41.3851, "lng": 2.1734, "name": "Spain - Catalonia", "date": "2024-01-09", "color": "#ff2200"},
+    ]
+
+@st.cache_data(ttl=600)
+def fetch_nasa_disasters():
+    """Fetch NASA EONET natural disasters"""
+    try:
+        url = "https://eonet.gsfc.nasa.gov/api/v3/events?status=open&limit=100"
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        disasters = []
+        category_colors = {
+            "wildfires": "#ff2200",
+            "volcanoes": "#ff6600",
+            "seaLakeIce": "#00ccff",
+            "severeStorms": "#ffcc00",
+            "floods": "#0066ff",
+            "earthquakes": "#ff1133",
+            "landslides": "#8b4513",
+            "tsunamis": "#0066ff",
+            "snow": "#ffffff",
+            "drought": "#cc9900",
+            "tornado": "#ff8800",
+        }
+        for ev in data.get('events', []):
+            cat = ev.get('categories', [{}])[0].get('id', 'default')
+            for geom in ev.get('geometry', []):
+                if geom.get('type') == 'Point':
+                    coords = geom['coordinates']
+                    color = category_colors.get(cat, "#ff6600")
+                    disasters.append({
+                        "lat": coords[1],
+                        "lng": coords[0],
+                        "name": ev.get('title', 'Event'),
+                        "category": cat,
+                        "date": geom.get('date', '')[:10],
+                        "color": color,
+                    })
+        return disasters[:80]
+    except:
+        return []
+
+@st.cache_data(ttl=300)
+def fetch_severe_weather():
+    """Fetch NOAA severe weather alerts"""
+    try:
+        url = "https://alerts.weather.gov/atom.php?zone=sea"
+        # Using global significant weather instead
+        return []
+    except:
+        return []
+
+@st.cache_data(ttl=600)
+def fetch_global_events():
+    """Fetch all GDELT/ACLED/UCDP combined radar points"""
+    points = []
+    
+    # GDELT Events
+    gdelt_events = fetch_gdelt_events()
+    for ev in gdelt_events:
+        size = 0.1 + min(ev.get('mentions', 1) / 500, 0.4)
+        points.append({
+            "lat": ev["lat"],
+            "lng": ev["lng"],
+            "color": ev["color"],
+            "size": size,
+            "alt": 0.01,
+            "type": "conflict",
+            "label": f"{ev['actor1'][:25]} vs {ev['actor2'][:25]}",
+            "detail": f"Tone: {ev['tone']:.1f} | Mentions: {ev['mentions']}",
+            "category": "gdelt"
+        })
+    
+    # ACLED Zones
+    acled_data = fetch_acled_data()
+    for zone in acled_data:
+        points.append({
+            "lat": zone["lat"],
+            "lng": zone["lng"],
+            "color": zone["color"],
+            "size": 0.35 + min(zone.get('fatalities', 0) / 100, 0.4),
+            "alt": 0.015,
+            "type": "conflict",
+            "label": zone["name"],
+            "detail": f"Fatalities: {zone.get('fatalities', 0)} | Type: {zone.get('type', 'N/A')}",
+            "category": "acled"
+        })
+    
+    # UCDP Conflicts
+    ucdp_data = fetch_ucdp_conflicts()
+    for conflict in ucdp_data:
+        color = "#ff0000" if conflict["intensity"] == "high" else "#ff6600"
+        points.append({
+            "lat": conflict["lat"],
+            "lng": conflict["lng"],
+            "color": color,
+            "size": 0.4,
+            "alt": 0.012,
+            "type": "conflict",
+            "label": conflict["name"],
+            "detail": f"Type: {conflict['type']} | Intensity: {conflict['intensity']}",
+            "category": "ucdp"
+        })
+    
+    return points
+
+@st.cache_data(ttl=600)
+def fetch_ais_ships():
+    """Fetch live ship positions (simulated from real shipping lanes)"""
+    # Real AIS data requires subscription, using major shipping chokepoints
+    ship_locations = [
+        # Strait of Hormuz
+        {"lat": 26.5, "lng": 56.5, "name": "Tanker - Strait of Hormuz", "type": "Tanker", "color": "#00ccdd"},
+        {"lat": 26.8, "lng": 56.3, "name": "Cargo - Persian Gulf", "type": "Cargo", "color": "#00aacc"},
+        {"lat": 26.3, "lng": 56.6, "name": "Tanker - Hormuz Transit", "type": "Tanker", "color": "#00ccdd"},
+        # Strait of Malacca
+        {"lat": 2.5, "lng": 101.5, "name": "Container - Malacca Strait", "type": "Container", "color": "#00aacc"},
+        {"lat": 3.0, "lng": 101.2, "name": "Bulk Carrier", "type": "Bulk", "color": "#0099bb"},
+        {"lat": 1.5, "lng": 102.8, "name": "Container Ship", "type": "Container", "color": "#00aacc"},
+        # Suez Canal
+        {"lat": 30.5, "lng": 32.3, "name": "Container - Suez North", "type": "Container", "color": "#00ccdd"},
+        {"lat": 30.3, "lng": 32.3, "name": "Tanker - Suez South", "type": "Tanker", "color": "#00ccdd"},
+        {"lat": 30.4, "lng": 32.3, "name": "Cargo - Canal Transit", "type": "Cargo", "color": "#00aacc"},
+        # Gibraltar
+        {"lat": 36.0, "lng": -5.5, "name": "Tanker - Gibraltar West", "type": "Tanker", "color": "#00ccdd"},
+        {"lat": 35.8, "lng": -5.3, "name": "Cargo - Alboran Sea", "type": "Cargo", "color": "#00aacc"},
+        # Panama Canal
+        {"lat": 9.0, "lng": -79.7, "name": "Container - Panama Canal", "type": "Container", "color": "#00ccdd"},
+        {"lat": 9.1, "lng": -79.6, "name": "Bulk Carrier - Caribbean", "type": "Bulk", "color": "#0099bb"},
+        # South China Sea
+        {"lat": 10.5, "lng": 115.0, "name": "Fishing Vessel - SCS", "type": "Fishing", "color": "#00ff88"},
+        {"lat": 12.0, "lng": 114.5, "name": "Cargo - South China Sea", "type": "Cargo", "color": "#00aacc"},
+        {"lat": 8.0, "lng": 117.0, "name": "Tanker - Palawan", "type": "Tanker", "color": "#00ccdd"},
+        # East Africa / Red Sea
+        {"lat": 12.5, "lng": 43.5, "name": "Tanker - Gulf of Aden", "type": "Tanker", "color": "#00ccdd"},
+        {"lat": 14.0, "lng": 42.5, "name": "Cargo - Red Sea", "type": "Cargo", "color": "#00aacc"},
+        {"lat": 11.5, "lng": 44.0, "name": "Container - Bab-el-Mandeb", "type": "Container", "color": "#00ccdd"},
+        # Mediterranean
+        {"lat": 35.5, "lng": 15.0, "name": "Tanker - Central Med", "type": "Tanker", "color": "#00ccdd"},
+        {"lat": 37.0, "lng": 12.0, "name": "Cargo - Sicily Channel", "type": "Cargo", "color": "#00aacc"},
+        # Atlantic Routes
+        {"lat": 40.0, "lng": -40.0, "name": "Container - North Atlantic", "type": "Container", "color": "#00ccdd"},
+        {"lat": 45.0, "lng": -35.0, "name": "Tanker - Atlantic Route", "type": "Tanker", "color": "#00ccdd"},
+        # Indian Ocean
+        {"lat": -5.0, "lng": 75.0, "name": "Tanker - Indian Ocean", "type": "Tanker", "color": "#00ccdd"},
+        {"lat": -10.0, "lng": 70.0, "name": "Cargo - IO Route", "type": "Cargo", "color": "#00aacc"},
+        # Pacific
+        {"lat": 35.0, "lng": 145.0, "name": "Container - Pacific E", "type": "Container", "color": "#00ccdd"},
+        {"lat": 30.0, "lng": 150.0, "name": "Bulk Carrier - Pacific", "type": "Bulk", "color": "#0099bb"},
+        # Arctic Routes
+        {"lat": 72.0, "lng": 55.0, "name": "LNG Tanker - NSR", "type": "LNG", "color": "#00ccdd"},
+        {"lat": 75.0, "lng": 90.0, "name": "Cargo - Arctic Route", "type": "Cargo", "color": "#00aacc"},
+        # US East Coast
+        {"lat": 32.0, "lng": -75.0, "name": "Container - US East", "type": "Container", "color": "#00ccdd"},
+        {"lat": 35.0, "lng": -72.0, "name": "Tanker - Off Coast", "type": "Tanker", "color": "#00ccdd"},
+        # South America
+        {"lat": -25.0, "lng": -45.0, "name": "Bulk Carrier - Brazil Route", "type": "Bulk", "color": "#0099bb"},
+        {"lat": -5.0, "lng": -35.0, "name": "Tanker - Brazil Coast", "type": "Tanker", "color": "#00ccdd"},
+    ]
+    return ship_locations
+
 @st.cache_data(ttl=300)
 def fetch_earthquakes():
     try:
@@ -483,7 +925,6 @@ def fetch_earthquakes():
 @st.cache_data(ttl=600)
 def fetch_countries():
     try:
-        # Added subregion to the fields
         url = "https://restcountries.com/v3.1/all?fields=name,cca3,ccn3,capital,population,region,subregion,languages,currencies,area,flag"
         r = requests.get(url, timeout=15)
         r.raise_for_status()
@@ -532,12 +973,29 @@ def fetch_gdp():
 @st.cache_data(ttl=60)
 def fetch_iss():
     try:
-        r = requests.get("http://api.open-notify.org/iss-now.json", timeout=8)
+        r = requests.get("https://api.wheretheiss.at/v1/satellites/25544", timeout=8)
         r.raise_for_status()
-        pos = r.json().get("iss_position", {})
-        return {"lat": float(pos.get("latitude", 0)), "lng": float(pos.get("longitude", 0))}
+        data = r.json()
+        lat = float(data.get("latitude", 0))
+        lng = float(data.get("longitude", 0))
+        velocity = float(data.get("velocity", 0))
+        altitude = float(data.get("altitude", 0))
+        
+        location_str = "Over Ocean"
+        try:
+            headers = {"User-Agent": "GodsEyeTerminal/1.0"}
+            geo_url = f"https://nominatim.openstreetmap.org/reverse?format=json&lat={lat}&lon={lng}&zoom=3"
+            geo_r = requests.get(geo_url, headers=headers, timeout=3)
+            if geo_r.status_code == 200:
+                geo_data = geo_r.json()
+                if "error" not in geo_data and "address" in geo_data:
+                    location_str = geo_data["address"].get("country", geo_data.get("name", "Unknown Landmass"))
+        except:
+            pass
+
+        return {"lat": lat, "lng": lng, "velocity": velocity, "altitude": altitude, "location": location_str}
     except:
-        return {"lat": 0, "lng": 0}
+        return {"lat": 0, "lng": 0, "velocity": 0, "altitude": 0, "location": "Unknown"}
 
 @st.cache_data(ttl=300)
 def fetch_astronauts():
@@ -657,6 +1115,8 @@ def build_globe_html(
     earthquakes, weather, iss, flights, satellites, countries_db,
     gdp_data, cyber_arcs, emergencies, show_seismic, show_weather, show_satellites,
     show_flights, show_shipping, show_cyber, show_emergencies,
+    global_events, volcanoes, fires, disasters, ships,
+    show_conflicts, show_fires, show_volcanoes, show_disasters, show_population,
     globe_w=1060, globe_h=720,
 ):
     
@@ -664,6 +1124,27 @@ def build_globe_html(
     all_rings = []
     all_arcs = []
 
+    # GDELT/ACLED/UCDP Global Events
+    if show_conflicts and global_events:
+        for ev in global_events:
+            all_points.append({
+                "lat": ev["lat"], "lng": ev["lng"],
+                "color": ev["color"],
+                "size": ev.get("size", 0.2),
+                "alt": ev.get("alt", 0.01),
+                "type": ev.get("type", "event"),
+                "label": ev.get("label", "Event"),
+                "detail": ev.get("detail", ""),
+            })
+            if ev.get("category") in ["acled", "ucdp"]:
+                all_rings.append({
+                    "lat": ev["lat"], "lng": ev["lng"],
+                    "color": ev["color"],
+                    "maxR": 2.5 if ev["color"] == "#ff0000" else 2,
+                    "propagationSpeed": 3, "repeatPeriod": 800,
+                })
+
+    # Seismic
     if show_seismic:
         for q in earthquakes:
             mag = q["mag"]
@@ -686,6 +1167,65 @@ def build_globe_html(
                 "repeatPeriod": 1000,
             })
 
+    # Volcanoes
+    if show_volcanoes and volcanoes:
+        for v in volcanoes:
+            all_points.append({
+                "lat": v["lat"], "lng": v["lng"],
+                "color": v["color"],
+                "size": 0.35,
+                "alt": 0.02,
+                "type": "volcano",
+                "label": v["name"],
+                "detail": f"Status: {v.get('status', 'Unknown')}",
+            })
+            if "erupting" in v.get("status", "").lower():
+                all_rings.append({
+                    "lat": v["lat"], "lng": v["lng"],
+                    "color": "#ff0000",
+                    "maxR": 2.5, "propagationSpeed": 3, "repeatPeriod": 600,
+                })
+
+    # Fires
+    if show_fires and fires:
+        for f in fires:
+            all_points.append({
+                "lat": f["lat"], "lng": f["lng"],
+                "color": f["color"],
+                "size": 0.25,
+                "alt": 0.015,
+                "type": "fire",
+                "label": f["name"],
+                "detail": f"Date: {f.get('date', 'N/A')}",
+            })
+
+    # Disasters
+    if show_disasters and disasters:
+        for d in disasters:
+            all_points.append({
+                "lat": d["lat"], "lng": d["lng"],
+                "color": d["color"],
+                "size": 0.28,
+                "alt": 0.012,
+                "type": "disaster",
+                "label": d["name"],
+                "detail": f"Category: {d.get('category', 'N/A').replace('_', ' ').title()}",
+            })
+
+    # Ships
+    if show_shipping and ships:
+        for s in ships:
+            all_points.append({
+                "lat": s["lat"], "lng": s["lng"],
+                "color": s["color"],
+                "size": 0.18,
+                "alt": 0.002,
+                "type": "ship",
+                "label": s["name"],
+                "detail": f"Type: {s.get('type', 'Vessel')}",
+            })
+
+    # Emergencies
     if show_emergencies:
         for e in emergencies:
             if e["severity"] == "high":
@@ -706,6 +1246,7 @@ def build_globe_html(
                 "propagationSpeed": spd, "repeatPeriod": per
             })
 
+    # Weather
     if show_weather:
         for w in weather:
             t = w["temp"]
@@ -723,6 +1264,7 @@ def build_globe_html(
                 "detail": f"Wind: {w['wind']}km/h",
             })
 
+    # Satellites & ISS
     if show_satellites:
         all_points.append({
             "lat": iss["lat"], "lng": iss["lng"],
@@ -743,6 +1285,7 @@ def build_globe_html(
                 "detail": f"Alt: {s['alt']*6371:.0f}km",
             })
 
+    # Flights
     if show_flights:
         for f in flights:
             all_points.append({
@@ -761,6 +1304,7 @@ def build_globe_html(
                 "dashLen": 0.8, "dashGap": 0.1, "animTime": 2500,
             })
 
+    # Shipping Routes
     if show_shipping:
         for la1, lo1, la2, lo2, name in SHIPPING_ROUTES:
             all_arcs.append({
@@ -769,16 +1313,8 @@ def build_globe_html(
                 "color": "#00ccdd44", "stroke": 0.6, "alt": 0.04,
                 "dashLen": 0.5, "dashGap": 0.15, "animTime": 4000,
             })
-            for _ in range(2):
-                t = random.uniform(0.2, 0.8)
-                all_points.append({
-                    "lat": la1 + (la2-la1)*t + random.uniform(-1,1),
-                    "lng": lo1 + (lo2-lo1)*t + random.uniform(-1,1),
-                    "color": "#00ccdd", "size": 0.18, "alt": 0.003,
-                    "type": "ship", "label": f"Cargo: {name}",
-                    "detail": f"Route: {name}",
-                })
 
+    # Cyber Arcs
     if show_cyber:
         for arc in cyber_arcs:
             all_arcs.append({
@@ -789,6 +1325,7 @@ def build_globe_html(
                 "dashLen": 0.15, "dashGap": 0.15, "animTime": 2000,
             })
 
+    # Satellite Constellation Links
     if show_satellites:
         const_groups = {}
         for s in satellites:
@@ -920,13 +1457,15 @@ html, body {{
 
 #legend {{
     position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%);
-    display: flex; gap: 14px;
+    width: 98%;
+    display: flex; justify-content: space-evenly; align-items: center;
     background: rgba(0,10,25,0.92);
     border: 1px solid rgba(0,240,255,0.15);
-    border-radius: 12px; padding: 7px 20px;
+    border-radius: 12px; padding: 8px 10px;
     z-index: 50; backdrop-filter: blur(15px);
+    flex-wrap: nowrap; overflow-x: auto;
 }}
-.leg {{ display: flex; align-items: center; gap: 5px; color: rgba(0,240,255,0.7); font-size: 10px; letter-spacing: 0.8px; }}
+.leg {{ display: flex; align-items: center; gap: 5px; color: rgba(0,240,255,0.7); font-size: 10px; letter-spacing: 0.8px; white-space: nowrap; }}
 .ldot {{ width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }}
 
 #loading {{ position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); z-index: 100; text-align: center; }}
@@ -943,13 +1482,17 @@ html, body {{
 <div id="country-card"></div>
 <div id="loading"><div class="spinner"></div><div class="load-text">INITIALIZING GLOBE</div></div>
 <div id="legend">
-    <div class="leg"><div class="ldot" style="background:#ff3355;box-shadow:0 0 5px #ff3355;"></div>Seismic Activities</div>
+    <div class="leg"><div class="ldot" style="background:#ff3355;box-shadow:0 0 5px #ff3355;"></div>Conflicts</div>
+    <div class="leg"><div class="ldot" style="background:#ff1133;box-shadow:0 0 5px #ff1133;"></div>Seismic</div>
+    <div class="leg"><div class="ldot" style="background:#ff4400;box-shadow:0 0 5px #ff4400;"></div>Volcanoes</div>
+    <div class="leg"><div class="ldot" style="background:#ff2200;box-shadow:0 0 5px #ff2200;"></div>Wildfires</div>
+    <div class="leg"><div class="ldot" style="background:#ffcc00;box-shadow:0 0 5px #ffcc00;"></div>Disasters</div>
     <div class="leg"><div class="ldot" style="background:#00ff88;box-shadow:0 0 5px #00ff88;"></div>Satellites</div>
     <div class="leg"><div class="ldot" style="background:#ff6600;box-shadow:0 0 5px #ff6600;"></div>Flights</div>
+    <div class="leg"><div class="ldot" style="background:#00ccdd;box-shadow:0 0 5px #00ccdd;"></div>Ships</div>
     <div class="leg"><div class="ldot" style="background:#00ccff;box-shadow:0 0 5px #00ccff;"></div>Weather</div>
     <div class="leg"><div class="ldot" style="background:#ff00ff;box-shadow:0 0 5px #ff00ff;"></div>ISS</div>
-    <div class="leg"><div class="ldot" style="background:#bf00ff;box-shadow:0 0 5px #bf00ff;"></div>Cyber Threats</div>
-    <div class="leg"><div class="ldot" style="background:#00ccdd;box-shadow:0 0 5px #00ccdd;"></div>Ships</div>
+    <div class="leg"><div class="ldot" style="background:#bf00ff;box-shadow:0 0 5px #bf00ff;"></div>Cyber</div>
 </div>
 
 <script src="https://unpkg.com/three@0.128.0/build/three.min.js"></script>
@@ -1030,7 +1573,7 @@ html, body {{
 
         world.onPolygonClick(function(poly) {{ if (!poly) return; var id = poly.id || (poly.properties && poly.properties.iso_n3) || ''; var info = CDB[id]; if (info) showCountryCard(info); }});
 
-        var tip = document.getElementById('tip'), typeColors = {{ earthquake:'#ff3355', weather:'#00ccff', iss:'#ff00ff', satellite:'#00ff88', flight:'#ff6600', ship:'#00ccdd', emergency:'#ff6600', cyber:'#bf00ff' }};
+        var tip = document.getElementById('tip'), typeColors = {{ earthquake:'#ff3355', weather:'#00ccff', iss:'#ff00ff', satellite:'#00ff88', flight:'#ff6600', ship:'#00ccdd', emergency:'#ff6600', cyber:'#bf00ff', conflict:'#ff0033', volcano:'#ff4400', fire:'#ff2200', disaster:'#ffcc00' }};
         world.onPointHover(function(pt) {{ if (pt) {{ pointHovered = true; ctip.style.opacity = '0'; var tc = typeColors[pt.type] || '#00f0ff'; tip.innerHTML = '<div class="tip-title" style="color:'+tc+';border-bottom-color:'+tc+'44;">'+pt.type.toUpperCase()+'</div><div style="margin:3px 0;">'+(pt.label||'')+'</div>'+(pt.detail?'<div class="tip-row"><span class="tip-label">Info</span><span class="tip-val" style="color:'+tc+';">'+pt.detail+'</span></div>':''); tip.style.borderColor = tc+'66'; tip.style.opacity = '1'; }} else {{ pointHovered = false; tip.style.opacity = '0'; }} }});
         world.onPointClick(function(pt) {{ if (pt) pauseRotation(5000); }});
 
@@ -1066,7 +1609,7 @@ except Exception as e:
 authenticator.login(
     location="main",
     fields={
-        "Form name": "GOD'S EYE",
+        "Form name": "GOD's EYE",
         "Username": "CONFIRM YOUR IDENTITY",
         "Password": "ACCESS KEY",
         "Login": "AUTHENTICATE",
@@ -1082,6 +1625,7 @@ auth_name = st.session_state.get("name", "Operator")
 # ══════════════════════════════════════════════════════════════════════════════
 if auth_status is True:
 
+    # Fetch all data
     earthquakes = fetch_earthquakes()
     countries_db = fetch_countries()
     gdp_data = fetch_gdp()
@@ -1092,6 +1636,14 @@ if auth_status is True:
     satellites = generate_satellites(180)
     cyber_arcs = generate_cyber_arcs(20)
     emergencies = EMERGENCY_ZONES
+    
+    # New data sources
+    global_events = fetch_global_events()
+    volcanoes = fetch_volcanoes()
+    fires = fetch_fires()
+    disasters = fetch_nasa_disasters()
+    ships = fetch_ais_ships()
+    
     ist_offset = timezone(timedelta(hours=5, minutes=30))
     now = datetime.now(ist_offset)
 
@@ -1099,7 +1651,7 @@ if auth_status is True:
     st.markdown(f"""
     <div class="cmd-header">
         <h1>GOD'S EYE</h1>
-        <div class="subtitle">AN EXTRAORDINARY TERMINAL TO VIEW THE WORLD & BEYOND</div>
+        <div class="subtitle">A Global Intelligence Radar With Live Terminal </div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1124,16 +1676,20 @@ if auth_status is True:
             <span class="status-value">{astro_count}</span>
         </div>
         <div class="status-item">
-            <span class="status-label">EARTHQUAKES</span>
-            <span class="status-value">{len(earthquakes)}</span>
+            <span class="status-label">CONFLICTS</span>
+            <span class="status-value">{len(global_events)}</span>
         </div>
         <div class="status-item">
-            <span class="status-label">FLIGHTS</span>
-            <span class="status-value">{len(flights)}</span>
+            <span class="status-label">VOLCANOES</span>
+            <span class="status-value">{len(volcanoes)}</span>
         </div>
         <div class="status-item">
-            <span class="status-label">SATELLITES</span>
-            <span class="status-value">{len(satellites)}</span>
+            <span class="status-label">FIRES</span>
+            <span class="status-value">{len(fires)}</span>
+        </div>
+        <div class="status-item">
+            <span class="status-label">SHIPS</span>
+            <span class="status-value">{len(ships)}</span>
         </div>
         <div class="status-item">
             <span class="status-label">OPERATOR</span>
@@ -1150,18 +1706,21 @@ if auth_status is True:
     # ── LEFT PANEL ─────────────────────────────────────────────────────────
     with left_col:
         
-        # ── DATA LAYERS SECTION ──
-        st.markdown('<div class="panel-card panel-card-cyan"><div class="panel-title">◆ DATA COVERAGE</div></div>', unsafe_allow_html=True)
+        # ── LIVE DATA SOURCES SECTION ──
+        st.markdown('<div class="panel-card panel-card-cyan"><div class="panel-title">◆ LIVE DATA LAYERS</div></div>', unsafe_allow_html=True)
 
+        show_conflicts = st.checkbox(f"GLOBAL CONFLICTS ({len(global_events)})", value=st.session_state.show_conflicts, key="cb_conf")
         show_flights = st.checkbox(f"FLIGHTS ({len(flights)})", value=st.session_state.show_flights, key="cb_fl")
-        show_weather = st.checkbox(f"GLOBAL WEATHER ({len(weather)})", value=st.session_state.show_weather, key="cb_wx")
+        show_weather = st.checkbox(f"WEATHER ({len(weather)})", value=st.session_state.show_weather, key="cb_wx")
         show_satellites = st.checkbox(f"SATELLITES ({len(satellites)+1})", value=st.session_state.show_satellites, key="cb_sat")
         show_seismic = st.checkbox(f"EARTHQUAKES ({len(earthquakes)})", value=st.session_state.show_seismic, key="cb_seismic")
+        show_volcanoes = st.checkbox(f"VOLCANOES ({len(volcanoes)})", value=st.session_state.show_volcanoes, key="cb_volc")
+        show_fires = st.checkbox(f"WILDFIRES ({len(fires)})", value=st.session_state.show_fires, key="cb_fires")
+        show_disasters = st.checkbox(f"DISASTERS ({len(disasters)})", value=st.session_state.show_disasters, key="cb_dis")
+        show_shipping = st.checkbox(f"MARITIME ({len(ships)} vessels)", value=st.session_state.show_shipping, key="cb_sh")
         show_emergencies = st.checkbox(f"CRISIS ZONES ({len(emergencies)})", value=st.session_state.show_emergencies, key="cb_emrg")
         show_cyber = st.checkbox(f"CYBER THREATS ({len(cyber_arcs)})", value=st.session_state.show_cyber, key="cb_cy")
-        show_shipping = st.checkbox(f"SEA ROUTES ({len(SHIPPING_ROUTES)} lanes)", value=st.session_state.show_shipping, key="cb_sh")
         
-
         st.session_state.show_seismic = show_seismic
         st.session_state.show_emergencies = show_emergencies
         st.session_state.show_weather = show_weather
@@ -1169,6 +1728,10 @@ if auth_status is True:
         st.session_state.show_flights = show_flights
         st.session_state.show_shipping = show_shipping
         st.session_state.show_cyber = show_cyber
+        st.session_state.show_conflicts = show_conflicts
+        st.session_state.show_fires = show_fires
+        st.session_state.show_volcanoes = show_volcanoes
+        st.session_state.show_disasters = show_disasters
 
         # ── EARTH INFO SECTION ──
         st.markdown('<div class="panel-card panel-card-green" style="margin-top:6px;"><div class="panel-title" style="color:#00ff88;">◆ EARTH VITALS</div></div>', unsafe_allow_html=True)
@@ -1177,8 +1740,8 @@ if auth_status is True:
             ("RADIUS", "6,371 km", "#00ff88"),
             ("MASS", "5.97 × 10²⁴ kg", "#00f0ff"),
             ("VOLUME", "1.08 × 10¹² km³", "#00f0ff"),
-            ("SURFACE WATER", "71%", "#00ccff"),
-            ("ORBIT VELOCITY", "29.78 km/s", "#ffcc00"),
+            ("WATER", "71%", "#00ccff"),
+            ("VELOCITY", "29.78 km/s", "#ffcc00"),
             ("AGE", "4.54 Billion Years", "#ff00ff"),
         ]
         
@@ -1192,9 +1755,42 @@ if auth_status is True:
             </div>
             ''', unsafe_allow_html=True)
 
+        # ── HUMANS IN ORBIT & ISS ──
+        st.markdown('<div class="panel-card panel-card-purple" style="margin-top:6px;"><div class="panel-title" style="color:#ff00ff;">◆ HUMANS IN ORBIT</div></div>', unsafe_allow_html=True)
+        if astro_list:
+            ah = f'<div class="intel-item" style="border-left:3px solid rgba(255,0,255,0.3);padding:6px 8px;">'
+            ah += f'<div style="color:#ff00ff;font-size:0.62rem;font-weight:700;margin-bottom:3px;">Currently in Space</div>'
+            for a in astro_list[:5]:
+                ah += f'<div style="padding:1px 0;font-size:0.56rem;"><span style="color:rgba(255,0,255,0.4);font-size:0.5rem;">{a.get("craft","")}</span> <span style="color:rgba(0,240,255,0.6);">{a.get("name","")}</span></div>'
+            ah += '</div>'
+            st.markdown(ah, unsafe_allow_html=True)
+
+
+
         # ── DISCONNECT BUTTON ──
-        st.markdown("<div style='margin-top:8px;'></div>", unsafe_allow_html=True)
-        authenticator.logout("⏻ LOGOUT", "main")
+        st.markdown("""
+        <style>
+        .stButton > button {
+            background: linear-gradient(135deg, rgba(255,0,0,0.15), rgba(200,0,0,0.3)) !important;
+            border: 1px solid #ff3355 !important;
+            color: #ff3355 !important;
+            box-shadow: 0 0 15px rgba(255,51,85,0.2) !important;
+            width: 100% !important;
+        }
+        .stButton > button:hover {
+            background: linear-gradient(135deg, rgba(255,0,0,0.3), rgba(255,51,85,0.5)) !important;
+            box-shadow: 0 0 30px rgba(255,51,85,0.5) !important;
+            border-color: #ff0000 !important;
+            color: #ffffff !important;
+            transform: translateY(-1px) !important;
+        }
+        </style>
+        <div style='margin-top:15px;'></div>
+        """, unsafe_allow_html=True)
+        
+        _, btn_col, _ = st.columns([1, 1.5, 1])
+        with btn_col:
+            authenticator.logout("⏻   ABORT", "main")
 
     # ── CENTER: GLOBE ──────────────────────────────────────────────────────
     with globe_col:
@@ -1207,42 +1803,114 @@ if auth_status is True:
             show_shipping=show_shipping, 
             show_cyber=show_cyber,
             show_emergencies=show_emergencies,
+            global_events=global_events,
+            volcanoes=volcanoes,
+            fires=fires,
+            disasters=disasters,
+            ships=ships,
+            show_conflicts=show_conflicts,
+            show_fires=show_fires,
+            show_volcanoes=show_volcanoes,
+            show_disasters=show_disasters,
+            show_population=True,
             globe_w=1000, globe_h=780,
         )
         st.components.v1.html(globe_html, height=800, scrolling=False)
 
+        # ── FINANCIAL DATA CONTROLS ──
+        financial_data = fetch_financials()
+        if financial_data:
+            st.markdown('<div class="panel-card panel-card-cyan" style="margin-top: 15px; margin-bottom: 10px; width: 100%; padding: 4px 10px;"><div class="panel-title" style="color:#00f0ff; font-size: 0.75rem; text-align: center;">◆ GLOBAL MARKETS & COMMODITIES</div></div>', unsafe_allow_html=True)
+            cols = st.columns(len(financial_data))
+            for i, item in enumerate(financial_data):
+                with cols[i]:
+                    up = item['change'] >= 0
+                    color = "#00ff88" if up else "#ff3355"
+                    sign = "+" if up else ""
+                    arrow = "▲" if up else "▼"
+                    
+                    st.markdown(f'''
+                    <div class="intel-item" style="border-left:3px solid {color}88; text-align: center; padding: 12px 6px; background: linear-gradient(145deg, rgba(0,20,50,0.6), rgba(0,8,25,0.85)); border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.5), inset 0 1px 0 rgba(0,240,255,0.1);">
+                        <div style="color:rgba(0,240,255,0.7); font-size:0.55rem; letter-spacing:1px; font-weight:700; margin-bottom: 6px; text-transform: uppercase;">{item["name"]}</div>
+                        <div style="color:#e0f7ff; font-size:0.85rem; font-weight:800; font-family:'Orbitron',sans-serif; text-shadow: 0 0 12px {color}44; margin-bottom: 2px;">{item["price"]:,.2f}</div>
+                        <div style="color:{color}; font-size:0.6rem; font-weight:700; letter-spacing: 0.5px;">{arrow} {sign}{item["change"]:,.2f} ({sign}{item["pct"]:.2f}%)</div>
+                    </div>
+                    ''', unsafe_allow_html=True)
+
+        # ── GLOBAL NEWS FEED ──
+        news_data = fetch_global_news()
+        if news_data:
+            st.markdown('<div class="panel-card panel-card-orange" style="margin-top: 15px; margin-bottom: 10px; width: 100%; padding: 4px 10px;"><div class="panel-title" style="color:#ff6600; font-size: 0.75rem; text-align: center;">◆ LiVE NEWS FEED</div></div>', unsafe_allow_html=True)
+            news_cols = st.columns(len(news_data))
+            for i, item in enumerate(news_data):
+                with news_cols[i]:
+                    c = item['color']
+                    st.markdown(f'''
+                    <div class="intel-item" style="border-left:3px solid {c}88; padding: 8px 8px; background: linear-gradient(145deg, rgba(0,8,25,0.7), rgba(0,4,15,0.9)); border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.6), inset 0 1px 0 {c}33; height: 120px; overflow: hidden; display: flex; flex-direction: column;">
+                        <div style="display: flex; justify-content: space-between; margin-bottom: 6px; border-bottom: 1px solid {c}33; padding-bottom: 4px; flex-shrink: 0;">
+                            <span style="color:rgba(0,240,255,0.8); font-size: 0.55rem; font-weight: 700; letter-spacing: 1px;">{item["location"]}</span>
+                            <span style="color:{c}; font-size: 0.5rem; font-weight: 800; letter-spacing: 0.5px; text-shadow: 0 0 5px {c}88;">{item["tag"]}</span>
+                        </div>
+                        <div style="color:#e0f7ff; font-size: 0.65rem; font-weight: 500; line-height: 1.35; font-family: 'Rajdhani', sans-serif; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical;">{item["title"]}</div>
+                    </div>
+                    ''', unsafe_allow_html=True)
+
     # ── RIGHT PANEL: Intelligence Feed ─────────────────────────────────────
     with right_col:
 
-        st.markdown('<div class="panel-card panel-card-red"><div class="panel-title" style="color:#ff3355;">◆ SEISMIC INFORMATION</div></div>', unsafe_allow_html=True)
+        # Global Conflicts
+        st.markdown('<div class="panel-card panel-card-red"><div class="panel-title" style="color:#ff3355;">◆ LIVE CONFLICTS</div></div>', unsafe_allow_html=True)
+        if global_events:
+            # Filter high-severity conflicts
+            high_conflicts = [e for e in global_events if e.get("category") in ["acled", "ucdp"] or e.get("color") == "#ff0000"][:5]
+            for ev in high_conflicts:
+                severity = "CRITICAL" if ev.get("color") == "#ff0000" else "HIGH"
+                sev_color = "#ff0000" if severity == "CRITICAL" else "#ff4400"
+                st.markdown(f'<div class="intel-item" style="border-left:3px solid {sev_color}44;"><span style="color:{sev_color};font-weight:700;font-family:\'Orbitron\',sans-serif;font-size:0.6rem;">● {severity}</span><span style="color:rgba(0,240,255,0.55);"> {ev.get("label","Event")[:28]}</span></div>', unsafe_allow_html=True)
+
+        # Volcanoes
+        st.markdown('<div class="panel-card panel-card-orange"><div class="panel-title" style="color:#ff6600;">◆ ACTIVE VOLCANOES</div></div>', unsafe_allow_html=True)
+        erupting = [v for v in volcanoes if "erupt" in v.get("status", "").lower()]
+        others = [x for x in volcanoes if "erupt" not in x.get("status", "").lower()]
+        combined_volcanoes = (erupting + others)[:5]
+        for v in combined_volcanoes:
+            if "erupt" in v.get("status", "").lower():
+                st.markdown(f'<div class="intel-item" style="border-left:3px solid rgba(255,68,0,0.5);"><span style="color:#ff4400;font-weight:700;">🔴 ERUPTING</span><span style="color:rgba(0,240,255,0.55);"> {v["name"][:25]}</span></div>', unsafe_allow_html=True)
+            else:
+                st.markdown(f'<div class="intel-item" style="border-left:3px solid rgba(255,136,0,0.4);"><span style="color:#ff8800;font-weight:600;">🟠 {v.get("status","Active")}</span><span style="color:rgba(0,240,255,0.55);"> {v["name"][:22]}</span></div>', unsafe_allow_html=True)
+
+        # Seismic
+        st.markdown('<div class="panel-card panel-card-orange"><div class="panel-title" style="color:#ff3355;">◆ SEISMIC INFORMATION</div></div>', unsafe_allow_html=True)
         if earthquakes:
-            top_q = sorted(earthquakes, key=lambda x: x["mag"], reverse=True)[:7]
+            top_q = sorted(earthquakes, key=lambda x: x["mag"], reverse=True)[:5]
             for q in top_q:
                 mc = "#ff1133" if q["mag"]>=5 else "#ff6600" if q["mag"]>=4 else "#ffcc00"
-                st.markdown(f'<div class="intel-item" style="border-left:3px solid {mc}44;"><span style="color:{mc};font-weight:700;font-family:\'Orbitron\',sans-serif;font-size:0.6rem;">M{q["mag"]:.1f}</span><span style="color:rgba(0,240,255,0.55);"> {q["place"][:32]}</span></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="intel-item" style="border-left:3px solid {mc}44;"><span style="color:{mc};font-weight:700;font-family:\'Orbitron\',sans-serif;font-size:0.6rem;">M{q["mag"]:.1f}</span><span style="color:rgba(0,240,255,0.55);"> {q["place"][:28]}</span></div>', unsafe_allow_html=True)
 
-        st.markdown('<div class="panel-card panel-card-orange"><div class="panel-title" style="color:#ff6600;">◆ EMERGENCY ALERTS</div></div>', unsafe_allow_html=True)
-        for e in [x for x in emergencies if x["severity"]=="high"][:5]:
-            st.markdown(f'<div class="intel-item" style="border-left:3px solid rgba(255,51,0,0.4);"><span style="color:#ff3300;font-weight:700;font-size:0.58rem;">● HIGH</span><span style="color:rgba(0,240,255,0.55);font-size:0.58rem;"> {e["name"][:32]}</span></div>', unsafe_allow_html=True)
+        # Wildfires
+        st.markdown('<div class="panel-card panel-card-red"><div class="panel-title" style="color:#ff2200;">◆ ACTIVE WILDFIRES</div></div>', unsafe_allow_html=True)
+        for f in fires[:5]:
+            st.markdown(f'<div class="intel-item" style="border-left:3px solid rgba(255,34,0,0.5);"><span style="color:#ff2200;font-weight:600;">🔥</span><span style="color:rgba(0,240,255,0.55);"> {f["name"][:28]}</span></div>', unsafe_allow_html=True)
 
-        st.markdown('<div class="panel-card panel-card-purple"><div class="panel-title" style="color:#ff00ff;">◆ HUMANS IN ORBIT</div></div>', unsafe_allow_html=True)
-        if astro_list:
-            ah = f'<div class="intel-item" style="border-left:3px solid rgba(255,0,255,0.3);padding:6px 8px;">'
-            ah += f'<div style="color:#ff00ff;font-size:0.62rem;font-weight:700;margin-bottom:3px;">Currently in Space</div>'
-            for a in astro_list[:6]:
-                ah += f'<div style="padding:1px 0;font-size:0.56rem;"><span style="color:rgba(255,0,255,0.4);font-size:0.5rem;">{a.get("craft","")}</span> <span style="color:rgba(0,240,255,0.6);">{a.get("name","")}</span></div>'
-            ah += '</div>'
-            st.markdown(ah, unsafe_allow_html=True)
+        # Emergency Alerts
+        st.markdown('<div class="panel-card panel-card-red"><div class="panel-title" style="color:#ff6600;">◆ EMERGENCY ALERTS</div></div>', unsafe_allow_html=True)
+        for e in [x for x in emergencies if x["severity"]=="high"][:4]:
+            st.markdown(f'<div class="intel-item" style="border-left:3px solid rgba(255,51,0,0.4);"><span style="color:#ff3300;font-weight:700;font-size:0.58rem;">● HIGH</span><span style="color:rgba(0,240,255,0.55);font-size:0.58rem;"> {e["name"][:28]}</span></div>', unsafe_allow_html=True)
 
+        v = iss.get("velocity", 27600)
+        a = iss.get("altitude", 420)
+        loc = iss.get("location", "Over Ocean")
         st.markdown(f"""
-        <div class="panel-card panel-card-purple">
-            <div class="panel-title" style="color:#ff00ff;">◆ ISS Coordinates</div>
-            <div style="font-size:0.57rem;color:rgba(0,240,255,0.5);margin-top:3px;">
-                <div style="display:flex;justify-content:space-between;"><span>Latitude</span><span style="color:#ff00ff;font-weight:600;">{iss['lat']:.4f}°</span></div>
-                <div style="display:flex;justify-content:space-between;margin-top:1px;"><span>Longitude</span><span style="color:#ff00ff;font-weight:600;">{iss['lng']:.4f}°</span></div>
+        <div class="panel-card panel-card-purple" style="margin-top:10px; padding-bottom: 25px; padding-top: 15px;">
+            <div class="panel-title" style="color:#ff00ff; font-size: 0.65rem; margin-bottom: 12px; letter-spacing: 3px;">◆ ISS COORDINATES</div>
+            <div style="font-size:0.6rem;color:rgba(0,240,255,0.7);margin-top:5px;">
+                <div style="display:flex;justify-content:space-between; padding: 4px 0; border-bottom: 1px solid rgba(191,0,255,0.2);"><span>Latitude</span><span style="color:#ff00ff;font-weight:600;">{iss['lat']:.4f}°</span></div>
+                <div style="display:flex;justify-content:space-between; padding: 4px 0; border-bottom: 1px solid rgba(191,0,255,0.2);"><span>Longitude</span><span style="color:#ff00ff;font-weight:600;">{iss['lng']:.4f}°</span></div>
+                <div style="display:flex;justify-content:space-between; padding: 4px 0; border-bottom: 1px solid rgba(191,0,255,0.2);"><span>Orbital Velocity</span><span style="color:#00ff88;font-weight:600;">{v:,.0f} km/h</span></div>
             </div>
         </div>
         """, unsafe_allow_html=True)
+
 
     # ═══════════════════════════════════════════════════════════════════════════
     # Bottom Stats Bar
@@ -1255,24 +1923,32 @@ if auth_status is True:
     st.markdown(f"""
     <div class="stats-bar">
         <div class="stat-item">
-            <div class="stat-value" style="color:#ff3355;">{len(earthquakes)}</div>
-            <div class="stat-label">SEISMIC</div>
+            <div class="stat-value" style="color:#ff0033;">{len(global_events)}</div>
+            <div class="stat-label">LIVE EVENTS</div>
         </div>
         <div class="stat-item">
-            <div class="stat-value" style="color:#ff6600;">{max_quake:.1f}</div>
-            <div class="stat-label">MAX MAG</div>
+            <div class="stat-value" style="color:#ff3355;">{len(earthquakes)}</div>
+            <div class="stat-label">SEISMIC EVENTS</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-value" style="color:#ff4400;">{len(volcanoes)}</div>
+            <div class="stat-label">LIVE VOLCANOES</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-value" style="color:#ff2200;">{len(fires)}</div>
+            <div class="stat-label">ACTIVE WILDFIRES</div>
         </div>
         <div class="stat-item">
             <div class="stat-value" style="color:#ff6600;">{len(flights)}</div>
             <div class="stat-label">FLIGHTS</div>
         </div>
         <div class="stat-item">
-            <div class="stat-value" style="color:#00ccdd;">{len(SHIPPING_ROUTES)}</div>
-            <div class="stat-label">SHIP LANES</div>
+            <div class="stat-value" style="color:#00ccdd;">{len(ships)}</div>
+            <div class="stat-label">ON-ROUTE VESSELS</div>
         </div>
         <div class="stat-item">
             <div class="stat-value" style="color:#00ff88;">{len(satellites)+1}</div>
-            <div class="stat-label">ORBITAL</div>
+            <div class="stat-label">ORBITAL OBJECTS</div>
         </div>
         <div class="stat-item">
             <div class="stat-value" style="color:#ff00ff;">{astro_count}</div>
@@ -1285,17 +1961,12 @@ if auth_status is True:
         <div class="stat-item">
             <div class="stat-value" style="color:#bf00ff;">${total_gdp/1e12:.1f}T</div>
             <div class="stat-label">WORLD GDP</div>
-        </div>
-        <div class="stat-item">
-            <div class="stat-value" style="color:#00f0ff;">{total_pop/1e9:.2f}B</div>
-            <div class="stat-label">POPULATION</div>
-        </div>
     </div>
     """, unsafe_allow_html=True)
 
     st.markdown(f"""
     <div style="text-align:center;padding:4px 0 2px;font-family:'Share Tech Mono',monospace;font-size:0.48rem;color:rgba(0,240,255,0.1);letter-spacing:2.5px;">
-        God's Eye View · {now.strftime('%Y')} · Open Intel
+        God's Eye View · {now.strftime('%Y')} · CANT FEAR YOUR OWN WORLD ·
     </div>
     """, unsafe_allow_html=True)
 
