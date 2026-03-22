@@ -1707,7 +1707,7 @@ if auth_status is True:
     with left_col:
         
         # ── LIVE DATA SOURCES SECTION ──
-        st.markdown('<div class="panel-card panel-card-cyan"><div class="panel-title">◆ LIVE DATA LAYERS</div></div>', unsafe_allow_html=True)
+        st.markdown('<div class="panel-card panel-card-cyan"><div class="panel-title">◆ DATA SOURCES</div></div>', unsafe_allow_html=True)
 
         show_conflicts = st.checkbox(f"GLOBAL CONFLICTS ({len(global_events)})", value=st.session_state.show_conflicts, key="cb_conf")
         show_flights = st.checkbox(f"FLIGHTS ({len(flights)})", value=st.session_state.show_flights, key="cb_fl")
